@@ -1,4 +1,3 @@
-// app/camera.tsx (or app/scan.tsx)
 import { useIsFocused } from "@react-navigation/native";
 import {
   BarcodeType,
@@ -9,8 +8,8 @@ import {
 } from "expo-camera";
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
-import React, { useCallback, useMemo, useState } from "react";
-import { Modal, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
 const SCANNABLE_TYPES = [
   "ean13",
@@ -34,41 +33,58 @@ export default function BarcodeScannerScreen() {
   const [facing, setFacing] = useState<CameraType>("back");
   const [flash, setFlash] = useState<FlashMode>("off");
 
-  // scanning state
-  const [cooldown, setCooldown] = useState(false);
-  const [result, setResult] = useState<ScanResult>(null); // holds last scan
-  const [showSheet, setShowSheet] = useState(false); // controls modal
-
-  const handleGrant = useCallback(async () => {
-    const res = await requestPermission();
-    if (!res.granted) {
-      // optionally show a toast/prompt to open settings
-    }
-  }, [requestPermission]);
-
-  const onBarcodeScanned = useCallback(
-    async ({ type, data }: { type: string; data: string }) => {
-      if (cooldown || !data || data.length < 6) return;
-
-      setCooldown(true);
-      setTimeout(() => setCooldown(false), 1200000);
-      console.log(`Scanned ${type}: ${data}`);
-      try {
-        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      } catch {}
-
-      // Navigate to the food page with the scanned barcode
-      router.push(`/food/${encodeURIComponent(data)}`);
-    },
-    [cooldown, router]
-  );
+  // hard gating
+  const [scanning, setScanning] = useState(true); // attach/detach handler
+  const handlingRef = useRef(false); // instant guard, no re-render
+  const lastScanTsRef = useRef(0); // optional throttle
+  const [result, setResult] = useState<ScanResult>(null);
+  const [showSheet, setShowSheet] = useState(false);
 
   const barCodeTypes = useMemo(
     () => SCANNABLE_TYPES as unknown as BarcodeType[],
     []
   );
 
-  // Permissions UI
+  const handleGrant = useCallback(async () => {
+    const res = await requestPermission();
+    // optionally prompt to open settings if not granted
+  }, [requestPermission]);
+
+  const onBarcodeScanned = useCallback(
+    async ({ type, data }: { type: string; data: string }) => {
+      // 1) Hard, instant gate (prevents multi-fire before a render)
+      if (handlingRef.current) return;
+
+      // 2) Optional: timestamp throttle
+      const now = Date.now();
+      if (now - lastScanTsRef.current < 1200) return;
+      lastScanTsRef.current = now;
+
+      // 3) Basic sanity
+      if (!data || data.length < 6) return;
+
+      // 4) Lock and pause scanning BEFORE any async work
+      handlingRef.current = true;
+      setScanning(false);
+
+      try {
+        try {
+          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+        } catch {}
+
+        setResult({ type, data });
+        setShowSheet(true);
+
+        // If you want to navigate instead of a sheet, do it here,
+        // then keep scanning disabled until you come back:
+        router.push(`/food/${encodeURIComponent(data)}`);
+      } finally {
+        // don’t unlock here; we’ll unlock when user closes the sheet
+      }
+    },
+    []
+  );
+
   if (!permission) {
     return (
       <View style={styles.center}>
@@ -90,38 +106,29 @@ export default function BarcodeScannerScreen() {
 
   const toggleFlash = () =>
     setFlash((f) => (f === "off" ? "on" : f === "on" ? "auto" : "off"));
-
   const flipFacing = () =>
     setFacing((cur) => (cur === "back" ? "front" : "back"));
 
-  const closeSheetAndRescan = () => {
-    setShowSheet(false);
-    // small delay so the camera remounts before it can fire again
-    setTimeout(() => setResult(null), 150);
-  };
-
   return (
     <View style={styles.container}>
-      {/* Only mount camera when focused and when the sheet is NOT open */}
       {isFocused && !showSheet ? (
         <CameraView
           style={styles.camera}
           facing={facing}
           flash={flash}
           barcodeScannerSettings={{ barcodeTypes: barCodeTypes }}
-          onBarcodeScanned={onBarcodeScanned}
+          // 👇 Only attach the handler when scanning is enabled
+          onBarcodeScanned={scanning ? onBarcodeScanned : undefined}
           onCameraReady={() => console.log("Scanner ready")}
         />
       ) : (
         <View style={styles.cameraPlaceholder} />
       )}
 
-      {/* Overlay reticle */}
+      {/* Overlay + controls (unchanged) */}
       <View pointerEvents="none" style={styles.overlay}>
         <View style={styles.reticle} />
       </View>
-
-      {/* Controls */}
       <View style={styles.bottomBar}>
         <TouchableOpacity style={styles.iconBtn} onPress={toggleFlash}>
           <Text style={styles.iconText}>⚡ {flash.toUpperCase()}</Text>
@@ -132,47 +139,11 @@ export default function BarcodeScannerScreen() {
           </Text>
         </TouchableOpacity>
       </View>
-
-      {/* Result sheet (controlled, non-blocking) */}
-      <Modal
-        visible={showSheet}
-        transparent
-        animationType="slide"
-        onRequestClose={closeSheetAndRescan}
-      >
-        <View style={styles.sheetBackdrop}>
-          <View style={styles.sheet}>
-            <Text style={styles.sheetTitle}>Barcode detected</Text>
-            <Text style={styles.sheetText}>
-              {result ? `${result.type.toUpperCase()}: ${result.data}` : ""}
-            </Text>
-
-            <View style={styles.sheetRow}>
-              <TouchableOpacity
-                style={styles.secondaryBtn}
-                onPress={closeSheetAndRescan}
-              >
-                <Text style={styles.secondaryBtnText}>Scan again</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.primaryBtn}
-                onPress={() => {
-                  // TODO: navigate to /food/[id] or fetch details here
-                  // router.push({ pathname: '/food/[id]', params: { id: result?.data ?? '' } });
-                  closeSheetAndRescan();
-                }}
-              >
-                <Text style={styles.primaryBtnText}>Open details</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
 
+/* styles … keep yours */
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#000" },
   center: {
@@ -201,7 +172,6 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 2,
     borderColor: "rgba(255,255,255,0.85)",
-    backgroundColor: "transparent",
   },
   bottomBar: {
     position: "absolute",
